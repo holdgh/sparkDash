@@ -433,10 +433,84 @@ URL：`/spark/:id` — **所有信息在一页**（宽屏双列，窄屏按 GPU 
 
 ### 6.1 Models 面板（启停你自己的模型）
 
-- **Add model** → 对话框字段：**Name**（必填）、**Directory on {spark}**（必填）、Start script、Stop script、Port、Notes
-- 列表每项可 **Start / Stop**，运行时显示**实时终端输出**（Show/Hide、Copy、Expand，仅保留最新 5000 行）
-- 偏好项：*Show the output when I start or stop a model*
-- 空态：*"Add the folder on {name} that holds a model's start.sh and stop.sh."*
+#### 概念：什么是"Model"？
+
+Models 面板里的一个 "model" **不是模型文件本身**，而是一个**启动器（launcher）**：指向 Spark 上的一个**文件夹**，该文件夹里放着你写的 `start.sh` 和 `stop.sh` 两个脚本。点击 Start 时，sparkDash 通过 **SSH 以该单元的 SSH 用户身份**在目标机上执行 `start.sh`，并把输出实时流回面板终端。
+
+关键行为（源码 `server/llmlaunch/commands.js`）：
+
+- **start 是"脱钩"运行的**（setsid 分离进程）：关浏览器、重启 sparkDash、SSH 断开，**模型都不会被杀**，之后还能用 *Output* 重新接入看日志
+- **stop 是"挂靠"运行的**：stop 脚本执行期间连接断了会被终止
+- 脚本输出写到目标机 `~/.cache/sparkdash/llm/<id>.log`（日志超 32MB 自动裁到 8MB）；面板终端最多显示**最新 5000 行**
+- 脚本**可以没有执行位**：有 `x` 权限就直接执行，否则用 `bash` 解释执行
+- 每个 Spark 最多注册 **24 个**启动器
+
+**入口**：Spark 详情页 **Models** 面板 → *Add model*（空列表时为 *Add your first model*）；Overview 卡片的 ModelLauncher 也能注册/启动第一个。面板状态每 20s 自动刷新。
+
+#### Add model 对话框：逐字段说明
+
+> 对话框顶部提示语：*"Point sparkDash at the folder on {Spark} that holds your model's start and stop scripts. It runs those scripts as the SSH user and shows their output here."*
+
+| 字段 | 必填 | 用途 | 填写规则与校验 | 示例 |
+|------|------|------|----------------|------|
+| **Name** | ✅ 必填 | 显示在列表、Overview 卡片上的名称；同时用于生成内部 ID（名称 + 随机后缀，所以改名不会串到旧进程的日志） | 非空，**≤ 80 字符**；纯展示用，不参与任何路径 | `Qwen3-8B vLLM`、`GLM 5.3 EXL3` |
+| **Directory on {Spark}** | ✅ 必填 | **start/stop 脚本所在的文件夹**（在目标机上的路径），运行时会 `cd` 进去执行 | ① 必须以 **`/` 或 `~/`** 开头（绝对路径或家目录相对路径）② **不允许空格** ③ 服务端还会强制检查：该目录**必须解析在 SSH 用户的家目录之内**，且**不是全局可写**（否则拒绝执行） | `/home/you/llms/qwen3-8b` 或 `~/llms/qwen3-8b` |
+| **Start script** | 选填（默认 `start.sh`） | 点 **Start** 时执行的脚本**文件名**（不是路径，相对于上面的目录） | 必须是**文件名**且以 **`.sh` 结尾**，只允许字母、数字、`. _ -`；执行前服务端校验：**必须是普通文件、不能是软链接、属主必须是 SSH 用户本人、不能全局可写** | `start.sh`、`run-vllm.sh` |
+| **Stop script** | 选填（默认 `stop.sh`） | 点 **Stop** 时执行的脚本文件名；也用于清理**在面板之外手动启动**的同款模型 | 规则同 Start script | `stop.sh`、`kill-vllm.sh` |
+| **Port** | 选填 | 填了之后，当 sparkDash 探测到**该端口上有 LLM 在应答**时，列表项会亮绿色 **`Serving :端口`** 标签（并显示模型 id） | 数字，**1–65535**；留空则只按脚本运行状态显示 Running/Stopped。**重要：此端口必须也出现在该单元的 LLM ports 列表里**（Add Spark / Edit Spark 里配的），否则探测不到、不会显示 Serving | `8000`、`8888` |
+| **Notes** | 选填 | 备注，显示在列表项名称下方 | ≤ 300 字符，纯展示 | `2-node cluster, needs ~100 GB` |
+
+按钮：*Cancel* 取消 / ***Add model*** 提交（编辑时为 *Save*）。校验错误会以红字显示在表单底部（如 *"The directory must start with / or ~/"*、*"Spaces are not supported in the directory path"*）。
+
+**修改限制**：模型**运行中时不能改 Directory / Start / Stop 三个字段**，服务端返回 *"This model is still running. Stop it before changing its directory or scripts."* —— 先 Stop 再改。
+
+#### 一个可用的最小示例（vLLM 场景）
+
+目标机 `~/llms/qwen3-8b/` 下放两个文件：
+
+```bash
+# start.sh —— 前台方式：脚本活着 = 模型在跑
+#!/usr/bin/env bash
+cd "$(dirname "$0")"
+exec vllm serve ./Qwen3-8B-FP8 \
+  --host 0.0.0.0 --port 8000 \
+  --served-model-name qwen3-8b
+```
+
+```bash
+# stop.sh —— 按端口收拾干净（也可以写 pkill -f "vllm serve"）
+#!/usr/bin/env bash
+fuser -k 8000/tcp 2>/dev/null || true
+```
+
+对话框填写：Name=`Qwen3-8B vLLM`，Directory=`~/llms/qwen3-8b`，Start/Stop 留默认，**Port=`8000`**，并确认该单元的 LLM ports 里包含 8000。
+
+> `start.sh` 写成"后台启动后立即退出"（`vllm serve ... &` + `exit 0`）也可以：状态靠**进程组存活检测**判断，脚本退出后只要模型进程还活着就仍显示 Running。
+
+#### 保存后的列表操作
+
+每行按状态显示不同按钮：
+
+| 状态标签 | 含义 |
+|----------|------|
+| **`Serving :端口`**（绿） | 端口上有 LLM 正在应答（仅在填了 Port 且该端口被探测时） |
+| **`Running`**（蓝） | start 脚本（或它拉起的进程组）还在目标机上运行 |
+| **`Stopped`** | 进程组已不存在 |
+| **`Stopping…`** | stop 脚本执行中 |
+
+| 按钮 | 行为 |
+|------|------|
+| **Start** | 执行 start 脚本（脱钩）；若**已有另一个模型在跑**，弹出 *"… is running. Stop it first?"* → *Stop it, then start* 会先跑旧模型的 stop 脚本、**成功后自动接续 start**（stop 失败则不会启动新模型） |
+| **Stop** | 执行 stop 脚本（挂靠，有确认）；即使状态是 Stopped 也保留此按钮，用于**清理在别处手动启动的模型** |
+| **Output** | 重新接入查看正在运行的 start 脚本输出 |
+| **Edit**（铅笔） | 打开同一对话框修改（运行中禁止改路径/脚本） |
+| **Remove**（×） | 从列表移除，确认语明确写着 *"Files stay untouched."* —— **只删注册记录，不删目标机上的任何文件** |
+
+**终端区**（面板底部，Start/Output 后出现）：状态徽标 + 标题 + 已运行时长；工具按钮 **Stop watching / Cancel**（停止观看，**脚本继续跑**；stop 场景则中止 stop 脚本）、**Copy**、**Expand**（全屏弹窗）、**Show/Hide output**；偏好勾选 *Show the output when I start or stop a model*（存本浏览器）。日志被截断时提示 *"Only the newest 5,000 lines are kept."*；跟随超过 **6 小时**会显示 *Stopped watching*（*detached*，模型照常运行）。
+
+**空态文案**：*"Add the folder on {name} that holds a model's start.sh and stop.sh. Then start and stop it from here and watch it load."* ；单元离线时提示 *"{name} is offline, so models cannot be started or stopped."*
+
+> **与 LLM 面板的关系**：Models 面板管**进程生命周期**（启/停/看日志），LLM server 面板管**运行指标**（tok/s、TTFT）。两者通过 **Port** 串联：Port 填对 + LLM ports 配对 → 启动后 LLM 卡自动亮起，形成"一键启动 → 立即看指标"的闭环。
 
 ### 6.2 LLM server 面板
 
@@ -466,6 +540,51 @@ URL：`/spark/:id` — **所有信息在一页**（宽屏双列，窄屏按 GPU 
 
 侧边栏 **Benchmarks** 区，或从 LLM 面板按钮进入。每页顶部有 **Run on** Spark 选择 chips（记住上次选择；默认取第一个在线且有 LLM 的非 worker 单元）。
 
+### 先懂概念：Prefill 与 Decode（读本章前的 3 分钟科普）
+
+本章的 Decode / Prefill 基准名字就来自**一次模型推理的两个阶段**。任何一次请求（比如发一条聊天消息）都固定分成首尾相接的两段：
+
+```text
+你的输入: "写一篇短文"
+     │
+     ▼
+┌─────────────┐   阶段一：Prefill（预填充）
+│ 并行读入全部 │   一次前向传播，把整段输入 token 同时算完
+│ 输入 token   │   → 生成第一个输出 token
+│             │   计算密集：所有输入一起过 Transformer，GPU 算力吃满
+└─────────────┘
+     │  ← 这里产生 TTFT（首字延迟）
+     ▼
+┌─────────────┐   阶段二：Decode（解码）
+│ 一个一个往外 │   自回归：每生成 1 个 token，都要拼回输入再算一次
+│ 吐 token     │   循环 N 次直到结束
+│ "写""一""篇" │   访存密集：每次只算 1 个 token，算力大量闲置，
+└─────────────┘   瓶颈在读权重 / KV cache 的显存带宽
+     │
+     ▼
+生成结束
+```
+
+**两阶段对比**
+
+| | **Prefill（预填充）** | **Decode（解码）** |
+|---|---|---|
+| 计算方式 | 输入 token **并行**一次算完 | 输出 token **串行**逐个生成 |
+| 耗时主导 | 输入越长越慢（线性增长） | 输出越长越慢（次数多） |
+| 硬件瓶颈 | **算力**（GPU 算得多） | **显存带宽**（反复读权重和 KV cache） |
+| 用户体感 | 等第一个字出现（**TTFT**） | 打字速度（**tok/s、ITL**） |
+| 对应指标 | Prefill tok/s、TTFT、Cached prefill | Decode tok/s、ITL、KV cache、队列 |
+
+**与本章及监测的关联**：
+
+- 粘贴 10 万字长文档 → **prefill 主导**：TTFT 飙升、GPU 利用率高，但 decode 还没开始
+- 让它写 2000 字长文 → **decode 主导**：首字很快，但要持续输出，KV cache 逐渐填满
+- 一次完整请求 `E2E 延迟 ≈ TTFT + 输出token数 × 每token间隔`
+- 因此 **Prefill 基准测的是"读题有多快"**（各上下文长度下的 prefill tok/s 与 TTFT），**Decode 基准测的是"打字有多快"**（各并发下的生成吞吐）—— 一个是算力/长上下文能力，一个是访存/批量吞吐能力，**两者都要测才完整**
+- 日常监测中同理：GPU 忙但 tok/s 低 = 可能卡在 prefill（prefill-bound）；Waiting 堆积、KV 满 = decode 阶段的容量不够用（见第十五章 15.3）
+
+### 各基准一览
+
 | 基准 | 用途 |
 |------|------|
 | **Decode** | 不同并发下的生成速度（tok/s） |
@@ -481,11 +600,150 @@ URL：`/spark/:id` — **所有信息在一页**（宽屏双列，窄屏按 GPU 
   - *Aggregate* = 所有并发流的总 decode tok/s；*Stream* = 单流平均
 - **收尾**：*Clear history* / *Copy results*（开启 Benchmark share image 后可 *Copy as image*）/ *Run again*；页底 History 表可回看
 
+#### 任务类型（Type）：Structured / Prose / Code / JSON
+
+**先明确一个关键点**：Type 只是**提示词模板的标签**，**不是 guided decoding / 语法约束**（源码注释原文：*"prompt labels only — not guided decoding"*）。选了 JSON 不会启用 JSON grammar 强制解码，模型仍是自由生成——它只决定"让模型写什么样的内容"。测试固定 **temp 0、thinking off**，保证可复现。
+
+| 类型 | 提示词内容（实际发送） | 输出特征 | 适用场景 |
+|------|------------------------|----------|----------|
+| **Structured**（默认） | *Count from 1 to 200. Output only the numbers, separated by spaces.* | 纯数字序列，格式极简、无歧义 | 实验室标准协议（对应官方 `bench_decode.py --structured`）；**结果最稳定**，适合快速横向对比 |
+| **Prose** | *Write a detailed step-by-step explanation of how a hash map works…* | 自然语言长文（哈希表逐步讲解） | 实验室默认基准 prompt；**最贴近聊天/文档生成**的真实负载 |
+| **Code** | 每路并发发送**不同的真实 Python 任务**（binary_search、merge_sort、lru_cache、dijkstra……共 32 个任务的目录），要求"只输出 Python 源码，无注释、无 docstring、无 markdown 围栏"，并附带测试 | 代码：缩进、标识符、符号密集 | **代码助手类负载**；各路前缀天然不同，专为并发测试设计（详见下方并发行为） |
+| **JSON** | *Emit only a JSON array of fake GPU metrics rows…*（大量引号/括号/逗号的符号密集型输出） | 紧凑 JSON 数据流 | **结构化 API / 数据导出类负载**；注意仍是普通提示词，非 guided JSON |
+
+**并发时的提示词行为**（`pickDecodeBenchPrompts`）：
+
+- **Code**：每路取目录中**不同的任务**（第 1 路 binary_search、第 2 路 merge_sort……），前缀天然不同；跑之前还有一次**不计分的 JIT warmup**，避免首路的前缀缓存命中让后续并发"占便宜"
+- **Structured / Prose / JSON**：各路共用同一提示词，但自动追加 `(stream i/N)` 后缀——**确保各路不共享前缀缓存块**，测的是真并发而非缓存红利
+- 所有类型都会自动追加*"继续生成直到达到最大输出长度，不要提前停止"*的指令，防止模型提前 EOS 导致实际生成远少于 Max tokens
+
+**使用建议**：
+
+1. **横向对比（两台机器/两次运行）务必用同一 Type** —— 不同 Type 的 tok/s 不可直接比较（数字流、散文、代码的分词密度和生成模式不同，天然有快慢差）
+2. 按自己的业务选：聊天/文档 → **Prose**；代码补全 → **Code**；结构化数据 → **JSON**；只求稳定基准 → **Structured**
+3. 常规做法：用 **Structured** 做可复现的基线对比，再用自己业务对应的 Type 复测一遍看真实表现
+
+#### 结果分析：线性度判读与"甜点并发"
+
+Decode bench 看的不是一个分数，而是**三个数字的联动**：Aggregate（聚合吞吐）、Stream（单流速度）、TTFT。核心问题是：**加并发换来的总吞吐，是不是以牺牲单流体验为代价？**
+
+**实测示例**（某单元，Max tokens 400，从 ×1 一路测到 ×32）：
+
+```text
+×1   38.5 agg   38.5/str  · TTFT  61ms
+×2   76.1 agg   38.1/str  · TTFT 143ms
+×3  112.7 agg   37.7/str  · TTFT  87ms
+×4  149.9 agg   37.6/str  · TTFT  95ms
+×5  183.1 agg   36.7/str  · TTFT 164ms
+×6  219.3 agg   36.7/str  · TTFT 119ms
+×8  290.7 agg   36.5/str  · TTFT 131ms
+×10 344.1 agg   34.7/str  · TTFT 169ms
+×12 412.8 agg   34.6/str  · TTFT 205ms
+×16 542.5 agg   34.2/str  · TTFT 214ms
+×24 753.9 agg   31.7/str  · TTFT 290ms
+×32 948.6 agg   30.4/str  · TTFT 480ms
+```
+
+判读步骤：
+
+**① 算线性效率 = 实际加速比 ÷ 理想加速比**
+
+| 并发 | Aggregate | 加速比 | 线性效率 | 单流变化 | 判定 |
+|------|-----------|--------|----------|----------|------|
+| ×2 | 76.1 | 1.98× | 99% | -1% | ✅ |
+| ×4 | 149.9 | 3.89× | 97% | -2% | ✅ |
+| ×8 | 290.7 | 7.55× | 94% | -5% | ✅ 仍接近线性 |
+| ×12 | 412.8 | 10.72× | 89% | -10% | ✅ |
+| ×16 | 542.5 | 14.09× | 88% | -11% | ✅ 边际开始缓降 |
+| ×24 | 753.9 | 19.58× | 82% | **-17.7%** | ⚠️ 逼近警戒线 |
+| ×32 | 948.6 | 24.64× | 77% | **-21%** | ❌ 单流跌破 -20% |
+
+- **效率 ≥ 90%**：vLLM continuous batching 正常，**GPU 远未饱和**，每加一路并发稳定贡献约一路的 tok/s
+- **效率 70–90%**：开始出现带宽/调度竞争（本例 ×10 起进入此区间，每路边际贡献从 35–38 逐步降到 24–26），仍可用
+- **效率 < 70% 或 Aggregate 走平**：吞吐到顶，再加并发只增加排队
+
+**② 看 Stream 是否跳水**
+
+- 本例单流从 38.5 缓降到 ×16 的 34.2（-11%），到 **×32 才跌到 30.4（-21%），首次突破 -20% 警戒线**
+- **警戒线**：单流比 ×1 掉 20% 以上说明带宽挤爆，甜点已过
+- **注意绝对值**：业务若要求单流 ≥35 tok/s，本例最多开到 **×10**（34.7）；对吞吐型批量业务，单流 -20% 可以接受
+
+**③ 看 TTFT 的涨幅**
+
+- bench 中所有流**同时发起**，×N 的 TTFT 包含排队 + prefill 交错开销；本例 61ms → 480ms，短 prompt 下绝对值仍 <0.5s，正常
+- **只看趋势，别抠单点**：注意 ×2=143ms 反而比 ×3=87ms 高——同发 burst 下 TTFT 抖动很大，单个点的异常不代表问题
+- **不要**把它当生产 TTFT 预期（真实长输入的 TTFT 由 prefill 决定，见 7.2）
+- 若 TTFT 出现**数量级跳变**（如毫秒级 → 秒级），才需要配合 Running/Waiting 确认是否严重排队
+
+**④ 定位两个拐点，得出甜点并发**
+
+先明确定义这两个"拐点"——它们不是官方术语，而是本手册为方便判读给**曲线开始变质的位置**起的名字：
+
+> **体验拐点（单流体验拐点）**
+> 继续加并发时，**单流速度（Stream tok/s）首次跌破基线（×1 单流）的 80%**（即下降超过 20%）的那一档。
+> *含义*：加并发带来的总吞吐增长，开始**明显挤压每一个用户的生成速度**——从"人人够用"变为"人人变慢"。它回答的问题是：**再加一路，现有用户的体验还撑得住吗？**
+
+> **吞吐拐点（聚合吞吐拐点）**
+> 继续加并发时，**Aggregate（聚合 tok/s）不再显著增长、曲线趋于走平**（相邻两档的边际增量明显萎缩，趋近于零甚至倒退）的那一档。
+> *含义*：GPU 算力/显存带宽/调度已**饱和**，再加并发不会产出更多 token，只会让请求在队列里越排越长（表现为 TTFT 暴涨、Running/Waiting 堆积）。它回答的问题是：**这台机器的总产能天花板在哪？**
+
+两者关系与取舍：
+
+- **甜点并发 = 两个拐点中先出现的那个的前一档**（取更保守者）——先撞上哪个，就由哪个说了算
+- **只有吞吐拐点**：还早着呢，但单流可能已经在慢慢变差，仍要对照 -20% 警戒线
+- **只有体验拐点**：产能还有富余，但面向交互式用户时**体验比吞吐更重要**，同样以它为准
+- **测试范围内两个都没出现**：说明拐点在更高并发处，可加档补测；**不要**把"没测到拐点"当成"无限可加"
+
+| 拐点 | 本例位置 | 现象 |
+|------|----------|------|
+| **体验拐点**（先到） | **×32** | 单流 30.4，跌破 ×1 的 80%（-21%） |
+| **吞吐拐点**（未到） | >×32 | Aggregate 仍在涨（×24→×32 还 +25.8%），未走平；但边际贡献已从 ~36/路降到 ~24/路 |
+
+**甜点并发 = 先出现的拐点的前一档 → 本例 ×24**；结合业务目标微调：
+
+- 交互式业务（保单流体验）：**×10 以内**（单流 ≥34.7）
+- 吞吐/体验平衡：**×16–24**（推荐对外服务上限）
+- 纯吞吐最大化：可补测 ×48/×64 找 Aggregate 真正走平的位置，但超过 ×24 后每路用户都在明显变慢，交互式业务无意义
+
+**横向对比要点**：两台机器同参数各测一遍，**拐点更靠右（仍线性的档位更高）的那台调度/带宽余量更大**，而不是只比 ×1 的单流数字。另外，本例与另一轮同参数测试在 ×1/×2/×4/×8 各点的 Aggregate 差异 **<0.5%** —— temp 0 + 固定 prompt 下这套 bench 可复现性极佳，数据可以放心用于严格对比。
+
 ### 7.2 Prefill
 
 - **输入**：**Context size** 按钮网格（超模型上下文的自动禁用）+ 自定义 token 数 + Add
 - 提示：*Unique-prefix prompts；128k–300k can take tens of minutes.*
 - **结果**：每上下文尺寸一行 prefill tok/s + TTFT；支持清历史 / 复制 / 重跑
+
+#### 结果分析：为什么输入越长，prefill tok/s 越小？
+
+**实测现象：上下文从 1k 加到 32k/128k，prefill tok/s 单调下降 —— 这是预期行为，不是测错了。**原因按主次：
+
+1. **Attention 计算量随序列长度超线性增长（主因）**
+   - Prefill 虽是所有输入 token 并行一次算完，但**每个 token 都要和前面所有 token 做 attention**
+   - 每 token 的计算量 = 常数部分（过权重矩阵）+ `O(序列长度)` 部分（attention）
+   - 输入 1k 时第二项可忽略，tok/s 接近满速；输入 128k 时每处理一个 token 都要 attend 128k 个位置，**单 token 成本变高 → 每秒能处理的 token 数下降**
+   - **下降曲线的斜率就是这台机器的"长上下文能力"**
+
+2. **KV cache 读写带宽压力**
+   - 长 prompt 的 prefill 要边算边把 KV 写入显存，attention 还要读回之前所有层的 KV
+   - 序列越长，**显存带宽消耗越大**；长上下文段 prefill 会从"算力受限"逐渐转向"带宽受限"，吞吐进一步降低
+
+3. **引擎调度因素（vLLM 尤其相关）**
+   - **Chunked prefill**：超长 prompt 被切成固定大小的 chunk 串行处理，chunk 间有调度开销
+   - prefill 与在线 decode 请求**共享调度器**：测试时实例上若有其他流量，长 prefill 会更频繁地被切分、让路
+   - 接近 `max_model_len` 时 KV 分配压力增大，可能再掉一档
+
+4. **数据可信度保证**：bench 刻意使用 **unique-prefix prompts（唯一前缀）绕开前缀缓存**，测的是真实的"从零读题"速度；若用重复前缀，长上下文数字会被缓存命中虚高，反而测不出真实曲线
+
+#### 曲线判读
+
+| 曲线形态 | 判断 |
+|----------|------|
+| 平缓下降（如不低于 1k 时的 80%） | ✅ 健康，符合预期 |
+| 中后段加速下滑 | ⚠️ 带宽/调度可能到瓶颈，对照详情页 Throttle 标签 |
+| 某一档**断崖式**下跌或直接失败 | ❌ 可能撞到 `max_model_len`、KV OOM 或量化配置问题 |
+| TTFT 增长略快于线性 | 正常（含 O(L²) 分量）；若快得离谱，看 Running/Waiting 是否在排队 |
+
+**实际用途**：这条曲线直接回答**"这台机器处理多长的文档会明显变慢"**。两台对比时，若 16k 前差不多、32k 后拉开差距，说明差异出在长上下文段的显存带宽或 KV 量化配置上——这比单看一个点的 tok/s 有信息量得多。
 
 ### 7.3 Quality
 
@@ -494,6 +752,91 @@ URL：`/spark/:id` — **所有信息在一页**（宽屏双列，窄屏按 GPU 
 - **其他**：Concurrency（默认 4，上限 16）、**Run label**（如 `fp4 KV`）、**Compare with**（与历史运行对比）
 - **结果**：总分 + 分类得分 + 历史表；配对比较给出 Run A / Run B、相同回复数、单边正确题数、**McNemar p 值**（p ≥ 0.05 显示 *difference within noise*）
 - 约束：每单元同时只能跑一个 quality；保留最近 30 次；默认全量约 755 个请求，thinking 类目较慢
+
+#### 八类场景（Categories）详解
+
+**总览**（✔ = 默认勾选）：
+
+| # | 类别 | 条目数 | Thinking | 单题上限 | 耗时 | 默认 | 测什么 |
+|---|------|--------|----------|----------|------|------|--------|
+| 1 | **QA** | 150 | 关 | 64 tok | 快 | ✔ | 短题直答的**基础准确率**（算术/字符串/日期） |
+| 2 | **Reasoning** | 40 | 开 | 8192 tok | 慢 | ✔ | 故事中多个量的**多步推理** |
+| 3 | **Arithmetic chain** | 40 | 开 | 12288 tok | 慢 | ✔ | 10 步**长链精确算术**（一步错全盘错） |
+| 4 | **State tracking** | 40 | 开 | 12288 tok | 慢 | ✔ | 25 次转移后的**状态跟踪**（类比变量追踪） |
+| 5 | **GSM8K** | 200 | 开 | 8192 tok | 慢 | ✔ | 公开基准：小学应用题（可与文献粗对照） |
+| 6 | **MMLU** | 285 | 关 | 1024 tok | 快 | ✔ | 公开基准：57 学科四选一**广度知识** |
+| 7 | **Instruction following** | 40 | 关 | 1024 tok | 快 | ✘ | **格式指令遵循**（代码解析输出的可靠性） |
+| 8 | **Long-context recall** | 按选档×条数 | 关 | 512 tok | 很慢 | ✘ | 长文档中**找最新值**（抗"旧值干扰"） |
+
+> 默认 6 类 = 150+40+40+40+200+285 = **755 个请求**。
+
+**1️⃣ QA —— 基础准确率（快速体检）**
+
+- **测什么**：短、可验证问题的直接正确率。*"a bad quantisation or KV-cache format shows up here first"* —— **换量化/KV 格式后最先在这里暴露问题**
+- **怎么测**：150 题 = 30 道固定题 + 120 道固定种子生成题（乘法、加减、字符串反转、字母计数、排序、二进制、日期偏移、最小公倍数），thinking 关
+- **怎么判分**：**回复必须"承诺"答案，不能只是提到它** —— 数字题取回复中**最后一个数字**（写 "391 or 5" 判错）；日期取最后一个日期；排序取最后一组数；单词/反转串需在短回复中整体命中或以它收尾。**"先答对又自我纠正"、"not Canberra" 这类绕法都判错**
+- **示例**：`What is 17 * 23?`
+- **成本**：快，每题 ≥64 token
+
+**2️⃣ Reasoning —— 多步推理**
+
+- **测什么**：在故事中同时理清多个量、按顺序做运算的能力
+- **怎么测**：40 道词题——三人各持若干物品，互给、丢失、翻倍，最后合并均分入箱、余数放罐；**要求同时答出两个数**；thinking 开
+- **怎么判分**：末行必须是 `Answer: <余数>, <每箱>`，**两个数字都必须完全正确**
+- **成本**：慢（思考模型更慢），每题上限 8192 token
+
+**3️⃣ Arithmetic chain —— 长链算术**
+
+- **测什么**：长算术链的**精确性**——链中任何一步出错，最终数字就错
+- **怎么测**：40 条链：从 3 位数起，依次做 10 步运算（乘、加、减、取余+1000、向下取整除法），全程保持整数；thinking 开
+- **怎么判分**：末行 `Answer: <数字>` 必须等于真值（接受 markdown/千分位逗号）
+- **成本**：慢，每题上限 12288 token
+
+**4️⃣ State tracking —— 状态跟踪**
+
+- **测什么**：长序列小变更中保持状态正确——**类比程序里的变量追踪**
+- **怎么测**：40 个故事：5 人各持初始 token，随后 25 个事件（转赠、捡到、给一半向下取整），问某人最后有多少；thinking 开
+- **怎么判分**：末行 `Answer: <数字>` 完全正确
+- **成本**：慢，每题上限 12288 token
+
+**5️⃣ GSM8K —— 公开基准·小学应用题**
+
+- **测什么**：课堂数学应用题能力；**公开数据集，结果可与文献粗对照**
+- **怎么测**：从 GSM8K test 集（MIT 协议）用固定种子**一次性抽取 200 题**（全集 1319 题），逐步求解；thinking 开
+- **怎么判分**：末行 `Answer: <数字>` 等于数据集答案；允许 `$`、千分位逗号、`%`、单位（如 "18 dollars"），**不允许第二个数值或含糊表述**
+- **⚠️ 误差提示**：200 题抽样的单次得分 **95% 置信区间约 ±4–7 分**——**小差异请用配对比较（McNemar）**，且**不要**与文献公布的 GSM8K 全集分数直接比
+
+**6️⃣ MMLU —— 公开基准·57 学科四选一**
+
+- **测什么**：法律、医学、数学、历史、计算机等 **57 个学科的广度知识与应试推理**
+- **怎么测**：从 MMLU test 集（MIT 协议）固定种子**每科抽 5 题 = 285 题**，四选一 A–D；thinking 关
+- **怎么判分**：末行 `Answer: <字母>`（大小写不限；"B. Paris" 可以，"B or C" 不行）或回复只有字母
+- **⚠️ 误差提示**：285 题单次得分 **约 ±5 分（95%）**；同样**勿与文献 few-shot MMLU 分数直接比较**
+
+**7️⃣ Instruction following —— 格式指令遵循（IFEval 风格）**
+
+- **测什么**：按**精确格式要求**输出的能力——*"the kind of thing that breaks pipelines that parse a model's output"*，直接关系生产解析管线的稳定性
+- **怎么测**：40 个短写作任务，每题 2–4 条**可程序化验证**的规则，从这些组随机组合：字数上下限、恰好 N 个 `* ` 项目符号、恰好 N 段（`***` 分隔）、整段包在双引号里、`<<标题>>`、必须/禁止出现的词、禁用逗号、全小写/全大写、以指定句子收尾、以 `P.S.` 结尾
+- **怎么判分**：**全部规则由代码检查（不是再用一个模型打分）**，全部满足才 pass
+- **示例**：*"Write a short piece about how bees make honey. 1. Use exactly 4 bullet points… 2. Do not use any commas."*
+- **默认不勾选的原因**：*"so older overall scores stay comparable"*——加进来会改变总分口径，历史对比就断了
+
+**8️⃣ Long-context recall —— 长上下文"针"召回**
+
+- **测什么**：**在长文档深处找到"最新值"而非过期值**的能力——正是 RAG/长对话场景的核心风险（模型抄了旧答案）
+- **怎么测**：生成一篇长填充文本，散布 **16 条** `Remember this: the code for <动物> is <5位数字>` 事实，其中 **4 条在文末附近被更正**；然后问每只动物的**当前**编码。上下文档位自选（**8k / 16k / 32k / 64k / 128k / 256k**），每档条数默认 2（最多 5）
+- **怎么判分**：**16 个最新编码全对才 pass**；被更正过却答了旧值 = stale，判错
+- **约束**：串行逐条执行（不并发）、每题 512 token、大档位**可能耗时数分钟**；超出模型上下文的档位自动跳过
+
+**使用说明（怎么选、怎么读）**
+
+1. **新手首次跑**：保持默认 6 类全选 → 得到一条基线（约 755 请求，thinking 类较慢，留足时间）
+2. **换量化/换 KV 格式**：先看 **QA**（最灵敏的体检项），再看 Reasoning/Arith 确认推理没退化
+3. **生产解析管线用户**：额外勾选 **Instruction following**（但注意总分口径变化，勾了就一直勾，别和历史裸分混比）
+4. **长文档/RAG 场景**：勾选 **Long-context recall**，第一轮选默认 32k 即可；模型宣称支持多长，就用对应档位实测
+5. **两台对比 / 前后对比**：**类别组合必须完全相同**；差异不大时用 **Compare with** 配对比较看 **McNemar p 值**（p ≥ 0.05 = *difference within noise*，别把噪声当提升）
+6. **提交值约定**：temperature 0、固定 `seed=1234`、题目由固定种子确定（suite v1）——同一套题可逐题配对；**请求错误/超时不计分**（排除出对比表）
+7. **成本预期**：QA/ MMLU / Instruction / Long 快；Reasoning / Arith / Track / GSM8K 是 thinking + 高 token 上限的"慢类"；同时只能跑一个 Quality，跑之前确认实例上没有真实流量
 
 ### 7.4 Tool Eval Bench
 
@@ -729,6 +1072,73 @@ DGX Spark 不支持 Wake-on-LAN；host 类型需在 Edit Spark 填 **MAC Address
 npm run typecheck   # 前端类型检查
 npm test            # 后端 node --test + 前端 vitest
 ```
+
+**Q11：npm 启动后，一关终端 sparkDash 进程就没了，怎么办？**
+
+**原因**：直接 `npm start` 时，node 进程挂在当前 shell 的会话下，终端关闭 / SSH 断开 → 进程收到 SIGHUP 被杀。三种解决方式按场景选：
+
+**方案一：screen（最直观，推荐快速上手）**
+
+```bash
+sudo apt-get install -y screen        # 已装可跳过
+
+screen -S sparkdash                   # 创建并进入名为 sparkdash 的会话
+cd /path/to/sparkDash
+npm start                             # 正常启动，日志照常滚动
+
+# 按 Ctrl+A 然后按 D 脱离会话（d = detach）—— 此时关闭终端也没关系
+```
+
+之后随时回来：
+
+```bash
+screen -ls                            # 列出会话（显示 Attached / Detached）
+screen -r sparkdash                   # 重新接入，页面数据一直保持
+```
+
+- 终端关闭、SSH 掉线，会话里的 sparkDash **继续运行**
+- `screen -r` 提示 *There is no screen to be resumed* 说明会话已结束（进程退出了），重新 `screen -S sparkdash` 即可
+- 局限：**服务器重启不会自动拉起，进程崩溃也没人拉起**
+
+**方案二：nohup（不装任何工具的一行命令）**
+
+```bash
+cd /path/to/sparkDash
+nohup npm start > sparkdash.log 2>&1 &
+tail -f sparkdash.log                 # 看日志；Ctrl+C 只退出 tail，不杀进程
+```
+
+- 后续查看日志用 `tail -f sparkdash.log`；停止服务用 `kill $(pgrep -f "node server/index.js")`
+- 局限：同 screen —— 不自动重启、不开机自启
+
+**方案三：systemd（长期生产的正确姿势，自动重启 + 开机自启）**
+
+```ini
+# /etc/systemd/system/sparkdash.service
+[Unit]
+Description=sparkDash
+After=network.target
+
+[Service]
+Type=simple
+User=你的用户名
+WorkingDirectory=/path/to/sparkDash
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now sparkdash
+sudo systemctl status sparkdash        # 查状态
+journalctl -u sparkdash -f             # 看日志
+```
+
+**建议**：日常试用用 **screen**（立刻可用）；确认要长期运行后切换 **systemd** —— 它额外解决 screen/nohup 不管的三件事：**开机自启、崩溃自动重启（Restart=always）、日志统一进 journal**。仓库 `scripts/` 下只有 Docker 部署辅助脚本，没有现成 systemd 单元，需自行创建上面的文件。
 
 ---
 
