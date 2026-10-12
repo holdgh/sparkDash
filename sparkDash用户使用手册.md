@@ -1009,6 +1009,7 @@ ssh -N -L 5555:127.0.0.1:5555 user@sparkdash-host
 - 服务端设置了 `SPARKDASH_TOKEN` 时，首次请求/WS 被拒会弹 **Access token** 对话框
 - 输入一次 → 校验 → 仅存本浏览器 → live 连接自动带 token 重连（无需刷新）
 - **Settings → Access token** 可查看/修改/清除
+- **对外部署（`BIND_HOST=0.0.0.0`）的完整设置步骤、`authMode` 校验与 systemd 写法见 FAQ Q12**
 
 ### 密钥与凭据
 
@@ -1139,6 +1140,66 @@ journalctl -u sparkdash -f             # 看日志
 ```
 
 **建议**：日常试用用 **screen**（立刻可用）；确认要长期运行后切换 **systemd** —— 它额外解决 screen/nohup 不管的三件事：**开机自启、崩溃自动重启（Restart=always）、日志统一进 journal**。仓库 `scripts/` 下只有 Docker 部署辅助脚本，没有现成 systemd 单元，需自行创建上面的文件。
+
+**Q12：`BIND_HOST=0.0.0.0` 对外开放时，怎么设置访问 token？**
+
+**背景**：绑定 `0.0.0.0` 且**不设** token 时是**开放模式**——任何能访问该端口的人都能看数据、改设置、操作电源，顶栏会显示 **Open access** 警告。对外部署务必设置 token。
+
+**步骤一：生成并设置 token（启动前）**
+
+```bash
+# 生成一个随机 token（也可以自己起一个不易猜的字符串）
+export SPARKDASH_TOKEN="$(openssl rand -hex 16)"
+
+# 推荐：强制"没配 token 就拒绝启动"，避免哪天忘了 token 裸奔
+export SPARKDASH_ALLOW_OPEN_REMOTE=0
+
+BIND_HOST=0.0.0.0 PORT=5555 npm start
+```
+
+- 环境变量名以 `SPARKDASH_TOKEN` 为准（兼容旧名 `DASHBOARD_TOKEN`，见 `server/auth.js`）
+- `SPARKDASH_ALLOW_OPEN_REMOTE=0` 的含义：非 loopback 绑定 + 没有 token → **拒绝启动**（fail closed）；不设或设为 `1` 则默认保持开放
+
+**步骤二：浏览器首次访问会弹 token 对话框**
+
+- 页面和静态资源仍可加载（不含机密），但第一次 API/WebSocket 请求被 401 拒绝时自动弹 **Access token** 对话框
+- 输入一次 → 校验通过 → 仅存本浏览器（localStorage）→ 实时连接自动带 token 重连，**无需刷新**
+- 之后可在 **Settings → Access token** 查看/修改/清除
+
+**步骤三：验证是否生效**
+
+```bash
+curl -s http://127.0.0.1:5555/api/health
+```
+
+看返回的 `authMode` 字段：
+
+| authMode | 含义 |
+|----------|------|
+| `bearer` | ✅ 已启用 token 鉴权（预期状态） |
+| `open-remote` | ⚠️ 对外绑定但**没有** token（开放模式） |
+| `required-missing` | ❌ 设了 `SPARKDASH_ALLOW_OPEN_REMOTE=0` 但没配 token（启动时应已失败，若看到说明配置异常） |
+| `loopback-open` | 仅本机访问，无需 token（默认） |
+
+**其他调用方式带 token**：
+
+```bash
+# REST / Prometheus 抓取：请求头
+curl -H "Authorization: Bearer $SPARKDASH_TOKEN" http://host:5555/api/health
+curl -H "Authorization: Bearer $SPARKDASH_TOKEN" http://host:5555/metrics
+
+# WebSocket（浏览器无法设头时）：查询串
+ws://host:5555/ws?token=<token>
+```
+
+**systemd 部署时**（配合 Q11 方案三）：token 写进 unit 文件而不是 shell 环境，避免"这个终端 export 过、那个终端没有"的坑：
+
+```ini
+[Service]
+Environment=BIND_HOST=0.0.0.0
+Environment=SPARKDASH_TOKEN=把生成的token粘到这里
+Environment=SPARKDASH_ALLOW_OPEN_REMOTE=0
+```
 
 ---
 
